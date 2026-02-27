@@ -1,0 +1,57 @@
+[Unit]
+Description=LinuxHello Authentication Daemon
+Documentation=https://github.com/Aelonium/Linuxhello
+# Start before any login manager / display manager
+Before=gdm.service sddm.service lightdm.service
+# Require the TPM resource manager if it's present (soft dependency)
+Wants=tpm2-abrmd.service
+After=tpm2-abrmd.service systemd-udev-settle.service fprintd.service
+
+[Service]
+Type=forking
+PIDFile=/run/linuxhello/lhd.pid
+
+# Runtime directory managed by systemd
+RuntimeDirectory=linuxhello
+RuntimeDirectoryMode=0700
+
+# State directory for persistent credential storage
+StateDirectory=linuxhello
+StateDirectoryMode=0700
+
+ExecStart=/usr/sbin/lhd
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Must run as root to access TPM (via tpm2-abrmd) and /var/lib/linuxhello
+User=root
+Group=root
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/linuxhello /run/linuxhello
+ProtectHome=yes
+PrivateTmp=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# Allow AF_UNIX sockets and TPM device access
+RestrictAddressFamilies=AF_UNIX
+DeviceAllow=/dev/tpm0    rw
+DeviceAllow=/dev/tpmrm0  rw
+# Capabilities: none needed beyond root's innate access to /dev/tpm*
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=linuxhello-daemon
+
+# Restart policy
+Restart=on-failure
+RestartSec=3s
+
+[Install]
+WantedBy=multi-user.target

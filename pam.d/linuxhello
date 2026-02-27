@@ -1,0 +1,52 @@
+# /etc/pam.d/linuxhello
+#
+# PAM configuration snippet for LinuxHello hardware-backed authentication.
+#
+# Usage – add ONE of the following patterns to your login PAM stack:
+#
+# Pattern A: LinuxHello with fallback to password (recommended for rollout)
+# --------------------------------------------------------------------------
+# Add this line BEFORE the existing @include common-auth line:
+#   auth  [success=1 new_authtok_reqd=ok ignore=ignore default=ignore]  \
+#               pam_linuxhello.so
+# This means: if linuxhello succeeds, skip 1 module (pam_unix); if it fails
+# or is unavailable, fall through to password auth.
+#
+# Pattern B: LinuxHello-only (no password fallback) – hardened mode
+# --------------------------------------------------------------------------
+#   auth  required  pam_linuxhello.so nofallback
+#
+# Example for /etc/pam.d/common-auth (Debian/Ubuntu):
+# -------------------------------------------------------------------------
+# auth  [success=1 new_authtok_reqd=ok ignore=ignore default=ignore] \
+#             pam_linuxhello.so
+# auth  [success=1 new_authtok_reqd=ok ignore=ignore default=die]    \
+#             pam_unix.so nullok_secure try_first_pass
+# auth  requisite  pam_deny.so
+# auth  required   pam_permit.so
+#
+# Example for /etc/pam.d/gdm-password (GNOME Display Manager):
+# -------------------------------------------------------------------------
+# auth  sufficient  pam_linuxhello.so
+# @include common-auth
+#
+# Account management (check enrollment):
+# -------------------------------------------------------------------------
+# account  [success=1 default=ignore]  pam_linuxhello.so
+#
+# ── Options ──────────────────────────────────────────────────────────────────
+# fallback     (default) Allow fallback to the next auth module if LinuxHello
+#              is unavailable or user has no enrolled credential.
+# nofallback   Hard failure if LinuxHello credential is absent.
+#              Use only after all users have been enrolled.
+# debug        Log verbose debug messages to syslog (auth facility).
+#
+# ── Notes ─────────────────────────────────────────────────────────────────────
+# * sudo: Add a separate stanza to /etc/pam.d/sudo if you want LinuxHello
+#   for privilege escalation (not recommended unless all admins are enrolled).
+# * Screen unlock (GDM/SDDM): The display manager's PAM profile
+#   (e.g., /etc/pam.d/gdm-password, /etc/pam.d/sddm) should be updated.
+# * The linuxhello daemon (lhd) must be running:
+#     systemctl enable --now linuxhello
+#
+auth  sufficient  pam_linuxhello.so

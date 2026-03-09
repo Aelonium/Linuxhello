@@ -25,11 +25,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <unistd.h>
 #include <errno.h>
 #include <termios.h>
 #include <time.h>
+#include <signal.h>
+#include <dirent.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <pwd.h>
 
 #include <openssl/sha.h>
@@ -37,7 +41,7 @@
 #include "../common/linuxhello.h"
 #include "../crypto/tpm_ops.h"
 #include "../storage/storage.h"
-#include "../biometric/fprintd_client.h"
+#include "../biometric/ir_face.h"
 
 /* ── Helpers ─────────────────────────────────────────────── */
 
@@ -128,7 +132,17 @@ static int cmd_enroll(const char *username,
     printf("LinuxHello Enrollment for user: %s\n", username);
     printf("Choose a PIN (minimum 4 characters, no maximum):\n");
 
+#define LH_PIN_MAX_ATTEMPTS 5
+    int pin_attempts = 0;
     do {
+        if (pin_attempts >= LH_PIN_MAX_ATTEMPTS) {
+            fprintf(stderr,
+                    "Error: too many failed PIN attempts (%d). Aborting.\n",
+                    LH_PIN_MAX_ATTEMPTS);
+            return 1;
+        }
+        pin_attempts++;
+
         if (read_pin_noecho("  Enter PIN: ", pin, sizeof(pin)) != 0) {
             fprintf(stderr, "Error reading PIN\n");
             return 1;
@@ -144,7 +158,8 @@ static int cmd_enroll(const char *username,
             return 1;
         }
         if (strcmp(pin, pin_conf) != 0) {
-            fprintf(stderr, "PINs do not match. Try again.\n");
+            fprintf(stderr, "PINs do not match. Try again. (%d/%d)\n",
+                    pin_attempts, LH_PIN_MAX_ATTEMPTS);
             memset(pin,      0, sizeof(pin));
             memset(pin_conf, 0, sizeof(pin_conf));
         } else {
@@ -207,28 +222,74 @@ static int cmd_enroll(const char *username,
         lh_tpm_teardown(&tpm);
     }
 
-    /* Biometric enrollment */
+    /* Biometric enrollment – IR face recognition */
     strncpy(cred.biometric_type, "none", sizeof(cred.biometric_type) - 1);
     cred.biometric_enrolled = false;
 
     if (!no_biometric) {
-        printf("\nFingerprint enrollment (optional):\n");
-        printf("  A fingerprint reader was %sdetected.\n",
-               lh_bio_is_enrolled(username) ? "already used and " : "");
-        printf("  Skip? [Y/n] ");
+        printf("\nIR face enrollment:\n");
+        printf("  IR camera: %s  (GREY format, 640x360)\n", LH_IR_DEVICE);
+        if (lh_face_is_enrolled(username))
+            printf("  Note: a face template is already present and will be "
+                   "replaced.\n");
+        printf("  Skip biometric enrollment? [Y/n] ");
+        fflush(stdout);
         char ans[8] = { 0 };
         if (fgets(ans, sizeof(ans), stdin) &&
             (ans[0] == 'n' || ans[0] == 'N'))
         {
-            printf("  Starting fingerprint enrollment via fprintd...\n");
-            if (lh_bio_enroll(username) == 0) {
-                strncpy(cred.biometric_type, "fingerprint",
+            /*
+             * User chose to enroll biometric.  Test the IR camera FIRST.
+             * If the camera is not functional we must abort the enrollment
+             * entirely rather than silently falling back to PIN-only mode,
+             * because the user explicitly requested biometric enrollment.
+             * A silent fallback would leave the system configured without
+             * the biometric the user expected.
+             */
+            printf("  Testing IR camera (%s)... ", LH_IR_DEVICE);
+            fflush(stdout);
+
+            int cam_rc = lh_ir_camera_test();
+            if (cam_rc != LH_FACE_OK) {
+                printf("FAILED (rc=%d)\n", cam_rc);
+                fprintf(stderr,
+                        "\nError: IR camera is not working (rc=%d).\n"
+                        "  Biometric enrollment cannot proceed.\n\n"
+                        "  The partially-created credential will be removed.\n"
+                        "  Fix the IR camera first, then re-run enrollment.\n\n"
+                        "  Quick diagnostics:\n"
+                        "    ls -la /dev/video*\n"
+                        "    v4l2-ctl --list-devices\n"
+                        "    sudo dmesg | grep -iE 'uvc|video|camera'\n"
+                        "    v4l2-ctl -d %s --list-formats-ext\n\n"
+                        "  If the device index is wrong, edit LH_IR_DEVICE_IDX\n"
+                        "  in src/biometric/ir_face.h and rebuild.\n",
+                        cam_rc, LH_IR_DEVICE);
+
+                /* Clean up the credential we already wrote to disk */
+                lh_storage_delete_credential(username);
+                return 1;
+            }
+            printf("OK\n");
+
+            int face_rc = lh_face_enroll(username,
+                                          cred.pubkey_der,
+                                          cred.pubkey_der_len);
+            if (face_rc == LH_FACE_OK) {
+                strncpy(cred.biometric_type, "face_ir",
                         sizeof(cred.biometric_type) - 1);
                 cred.biometric_enrolled = true;
-                printf("  Fingerprint enrolled successfully.\n");
+                printf("  IR face enrolled successfully.\n");
             } else {
-                printf("  Fingerprint enrollment failed; "
-                       "PIN-only mode will be used.\n");
+                fprintf(stderr,
+                        "\nError: IR face enrollment failed (rc=%d).\n"
+                        "  The partially-created credential will be removed.\n"
+                        "  If the camera opened but faces were not detected,\n"
+                        "  ensure good IR illumination and position your face\n"
+                        "  within 30–60 cm of the camera.\n",
+                        face_rc);
+                lh_storage_delete_credential(username);
+                return 1;
             }
         } else {
             printf("  Skipping biometric enrollment; PIN-only mode.\n");
@@ -278,7 +339,24 @@ static int cmd_revoke(const char *username)
         cred.tpm_available && cred.tpm_handle != 0)
     {
         lh_tpm_ctx_t tpm;
-        if (lh_tpm_init(&tpm) == 0) {
+
+        /*
+         * lh_tpm_init() connects to tpm2-abrmd over D-Bus / Unix socket and
+         * can block indefinitely if the daemon is absent or busy.  Install
+         * SIGALRM as SIG_IGN so the alarm interrupts blocking syscalls
+         * (returning EINTR) without killing the process, then cancel after.
+         */
+        struct sigaction sa_old;
+        struct sigaction sa_alrm;
+        memset(&sa_alrm, 0, sizeof(sa_alrm));
+        sa_alrm.sa_handler = SIG_IGN;
+        sigaction(SIGALRM, &sa_alrm, &sa_old);
+        alarm(10);
+        int tpm_rc = lh_tpm_init(&tpm);
+        alarm(0);
+        sigaction(SIGALRM, &sa_old, NULL);
+
+        if (tpm_rc == 0) {
             printf("Removing TPM key (handle 0x%08x)... ", cred.tpm_handle);
             fflush(stdout);
             if (lh_tpm_delete_key(&tpm, cred.tpm_handle) == 0)
@@ -287,17 +365,22 @@ static int cmd_revoke(const char *username)
                 printf("WARNING: TPM key removal failed (may already be gone)\n");
             lh_tpm_nv_reset_counter(&tpm, cred.user_slot);
             lh_tpm_teardown(&tpm);
+        } else {
+            printf("WARNING: TPM unreachable – skipping hardware key removal.\n"
+                   "         The TPM handle 0x%08x may be a dangling entry.\n"
+                   "         Use 'tpm2_evictcontrol' manually if needed.\n",
+                   cred.tpm_handle);
         }
     }
 
-    /* Remove biometric enrollment */
+    /* Remove biometric (face) template */
     if (cred.biometric_enrolled) {
-        printf("Removing fprintd enrollment... ");
+        printf("Removing face template... ");
         fflush(stdout);
-        if (lh_bio_delete_enrolled(username) == 0)
+        if (lh_face_delete(username) == 0)
             printf("OK\n");
         else
-            printf("WARNING: fprintd removal failed\n");
+            printf("WARNING: face template removal failed\n");
     }
 
     /* Remove credential files */
@@ -307,6 +390,156 @@ static int cmd_revoke(const char *username)
     }
 
     printf("LinuxHello credential revoked for user '%s'\n", username);
+    return 0;
+}
+
+/* ── Command: purge ─────────────────────────────────────────
+ *
+ * Directly removes all on-disk credential files for a user (or every user
+ * with --all) without touching the TPM or fprintd.  Use this when:
+ *   • lh-enroll revoke blocks because tpm2-abrmd is unavailable
+ *   • a credential was enrolled for the wrong user
+ *   • you need a clean slate before re-enrolling
+ *
+ * TPM handles and biometric templates are left behind; clean those up
+ * manually via 'tpm2_evictcontrol' and 'fprintd-delete' if needed.
+ * ─────────────────────────────────────────────────────────── */
+
+static int cmd_purge(const char *username)
+{
+    if (geteuid() != 0) {
+        fprintf(stderr, "Error: purge must be run as root\n");
+        return 1;
+    }
+    if (!lh_storage_credential_exists(username)) {
+        printf("No credential files found for user '%s' – nothing to do.\n",
+               username);
+        return 0;
+    }
+    printf("Purging credential files for user '%s'... ", username);
+    fflush(stdout);
+    if (lh_storage_delete_credential(username) != 0) {
+        fprintf(stderr, "FAILED: %s\n", strerror(errno));
+        return 1;
+    }
+    /* Also remove face embedding if present */
+    lh_face_delete(username);
+    printf("OK\n");
+    return 0;
+}
+
+static int cmd_purge_all(void)
+{
+    if (geteuid() != 0) {
+        fprintf(stderr, "Error: purge must be run as root\n");
+        return 1;
+    }
+
+    DIR *d = opendir(LH_STATE_DIR);
+    if (!d) {
+        if (errno == ENOENT) {
+            printf("No credential store found at %s – nothing to do.\n",
+                   LH_STATE_DIR);
+            return 0;
+        }
+        fprintf(stderr, "Error: cannot open %s: %s\n",
+                LH_STATE_DIR, strerror(errno));
+        return 1;
+    }
+
+    int purged = 0;
+    int errors = 0;
+    struct dirent *ent;
+
+    while ((ent = readdir(d)) != NULL) {
+        /* Skip . and .. and any plain files at the top level */
+        if (ent->d_name[0] == '.')
+            continue;
+
+        /* Confirm it's a directory before treating it as a user entry */
+        char full[512];
+        snprintf(full, sizeof(full), LH_STATE_DIR "/%s", ent->d_name);
+        struct stat st;
+        if (stat(full, &st) != 0 || !S_ISDIR(st.st_mode))
+            continue;
+
+        printf("  purging '%s'... ", ent->d_name);
+        fflush(stdout);
+        if (lh_storage_delete_credential(ent->d_name) == 0) {
+            printf("OK\n");
+            purged++;
+        } else {
+            printf("FAILED (%s)\n", strerror(errno));
+            errors++;
+        }
+    }
+    closedir(d);
+
+    if (purged == 0 && errors == 0)
+        printf("No credential entries found – nothing to do.\n");
+    else
+        printf("Purge complete: %d purged, %d error(s).\n", purged, errors);
+
+    return errors > 0 ? 1 : 0;
+}
+
+/* ── Command: purge-tpm ──────────────────────────────────────
+ *
+ * Evicts all LinuxHello persistent handles from the TPM without touching
+ * credential files.  Use when enrollment left stale TPM handles behind
+ * (error 0x14c: "persistent object already defined").
+ *
+ * After running this, re-enroll with: sudo lh-enroll enroll --user <name>
+ * ─────────────────────────────────────────────────────────── */
+
+static int cmd_purge_tpm(void)
+{
+    if (geteuid() != 0) {
+        fprintf(stderr, "Error: purge-tpm must be run as root\n");
+        return 1;
+    }
+
+    printf("Scanning TPM for stale LinuxHello handles "
+           "(0x%08x–0x%08x)...\n",
+           LH_TPM_HANDLE_BASE, LH_TPM_HANDLE_MAX);
+    fflush(stdout);
+
+    lh_tpm_ctx_t tpm;
+
+    /* Same SIGALRM guard used by cmd_revoke */
+    struct sigaction sa_old, sa_alrm;
+    memset(&sa_alrm, 0, sizeof(sa_alrm));
+    sa_alrm.sa_handler = SIG_IGN;
+    sigaction(SIGALRM, &sa_alrm, &sa_old);
+    alarm(10);
+    int tpm_rc = lh_tpm_init(&tpm);
+    alarm(0);
+    sigaction(SIGALRM, &sa_old, NULL);
+
+    if (tpm_rc != 0) {
+        fprintf(stderr,
+                "Error: cannot connect to TPM (is tpm2-abrmd running?)\n"
+                "Try: sudo systemctl start tpm2-abrmd\n"
+                "Then re-run: sudo lh-enroll purge-tpm\n");
+        return 1;
+    }
+
+    uint32_t evicted = 0;
+    int rc = lh_tpm_evict_range(&tpm,
+                                 LH_TPM_HANDLE_BASE, LH_TPM_HANDLE_MAX,
+                                 &evicted);
+    lh_tpm_teardown(&tpm);
+
+    if (rc != 0) {
+        fprintf(stderr, "Error: TPM eviction failed\n");
+        return 1;
+    }
+
+    if (evicted == 0)
+        printf("No stale LinuxHello handles found – TPM is clean.\n");
+    else
+        printf("Evicted %u stale handle(s) from TPM.\n", evicted);
+
     return 0;
 }
 
@@ -384,9 +617,17 @@ static void usage(const char *prog)
             "  enroll   [--user <username>] [--no-biometric] [--degraded]\n"
             "  revoke   [--user <username>]\n"
             "  status   [--user <username>]\n"
-            "  rotate   [--user <username>] [--no-biometric] [--degraded]\n\n"
+            "  rotate   [--user <username>] [--no-biometric] [--degraded]\n"
+            "  purge    [--user <username> | --all]\n"
+            "             Remove on-disk credential files without touching the\n"
+            "             TPM or biometrics. Use when 'revoke' blocks or a key\n"
+            "             was enrolled for the wrong user.\n"
+            "  purge-tpm\n"
+            "             Evict stale LinuxHello handles from the TPM (no file\n"
+            "             changes). Fix for error 0x14c on re-enroll.\n\n"
             "Options:\n"
             "  --user <username>   Target user (default: current user)\n"
+            "  --all               (purge only) purge every enrolled user\n"
             "  --no-biometric      Skip biometric enrollment\n"
             "  --degraded          Force software-key mode (no TPM)\n\n"
             "Version: %d.%d.%d\n",
@@ -399,13 +640,58 @@ int main(int argc, char *argv[])
     if (argc < 2) { usage(argv[0]); return 1; }
 
     const char *cmd          = argv[1];
+    char       *username_buf = NULL;   /* heap copy – always use this */
     const char *username     = NULL;
-    bool        no_biometric = false;
+    bool        no_biometric  = false;
     bool        force_degraded = false;
+    bool        purge_all      = false;
 
-    /* Get current user as default */
-    struct passwd *pw = getpwuid(getuid());
-    if (pw) username = pw->pw_name;
+    /*
+     * Resolve the default username when running under sudo / su.
+     *
+     * Priority:
+     *   1. SUDO_USER env var  (set by sudo, absent under "sudo -i" / "su -")
+     *   2. /proc/self/loginuid  (kernel-maintained, survives env resets and
+     *      "sudo -i").  A value of 4294967295 (0xFFFFFFFF) means unset.
+     *   3. getpwuid(getuid()) – last resort; if this resolves to root and
+     *      no explicit --user was given we reject the call to avoid
+     *      accidentally targeting root.
+     *
+     * getpwnam()/getpwuid() return pointers into a static buffer that is
+     * overwritten by the next pw* call (e.g. inside validate_username()).
+     * We strdup() immediately so the pointer stays valid.
+     */
+
+    /* 1. SUDO_USER */
+    const char *sudo_user = getenv("SUDO_USER");
+    if (sudo_user && *sudo_user) {
+        errno = 0;
+        struct passwd *pw = getpwnam(sudo_user);
+        if (pw) username_buf = strdup(pw->pw_name);
+    }
+
+    /* 2. /proc/self/loginuid */
+    if (!username_buf) {
+        FILE *lf = fopen("/proc/self/loginuid", "r");
+        if (lf) {
+            unsigned long luid = ULONG_MAX;
+            if (fscanf(lf, "%lu", &luid) == 1 &&
+                luid != ULONG_MAX && luid != 4294967295UL)
+            {
+                struct passwd *pw = getpwuid((uid_t)luid);
+                if (pw) username_buf = strdup(pw->pw_name);
+            }
+            fclose(lf);
+        }
+    }
+
+    /* 3. Effective UID fallback */
+    if (!username_buf) {
+        struct passwd *pw = getpwuid(getuid());
+        if (pw) username_buf = strdup(pw->pw_name);
+    }
+
+    username = username_buf;
 
     for (int i = 2; i < argc; i++) {
         if ((strcmp(argv[i], "--user") == 0 || strcmp(argv[i], "-u") == 0)
@@ -415,10 +701,38 @@ int main(int argc, char *argv[])
             no_biometric = true;
         else if (strcmp(argv[i], "--degraded") == 0)
             force_degraded = true;
+        else if (strcmp(argv[i], "--all") == 0)
+            purge_all = true;
     }
 
     if (!username || !*username) {
         fprintf(stderr, "Error: cannot determine username\n");
+        free(username_buf);
+        return 1;
+    }
+
+    /* purge --all doesn't need a username at all – dispatch early */
+    if (strcmp(cmd, "purge") == 0 && purge_all) {
+        free(username_buf);
+        return cmd_purge_all();
+    }
+
+    if (!username || !*username) {
+        fprintf(stderr, "Error: cannot determine username\n");
+        free(username_buf);
+        return 1;
+    }
+
+    /*
+     * Safety guard: if the name was auto-detected (not from --user) and it
+     * resolved to root, refuse.  Accidentally operating on root's credential
+     * is almost always a mistake.  Pass --user root explicitly if intentional.
+     */
+    if (username == username_buf && strcmp(username, "root") == 0) {
+        fprintf(stderr,
+                "Error: could not identify the invoking user – resolved to root.\n"
+                "Run with --user <username> to specify the target user explicitly.\n");
+        free(username_buf);
         return 1;
     }
 
@@ -430,6 +744,10 @@ int main(int argc, char *argv[])
         return cmd_status(username);
     else if (strcmp(cmd, "rotate") == 0)
         return cmd_rotate(username, no_biometric, force_degraded);
+    else if (strcmp(cmd, "purge") == 0)
+        return cmd_purge(username);
+    else if (strcmp(cmd, "purge-tpm") == 0)
+        return cmd_purge_tpm();
     else {
         fprintf(stderr, "Unknown command: %s\n", cmd);
         usage(argv[0]);

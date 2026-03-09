@@ -19,7 +19,7 @@ RuntimeDirectoryMode=0700
 StateDirectory=linuxhello
 StateDirectoryMode=0700
 
-ExecStart=/usr/sbin/lhd
+ExecStart=/usr/local/sbin/lhd
 ExecReload=/bin/kill -HUP $MAINPID
 
 # Must run as root to access TPM (via tpm2-abrmd) and /var/lib/linuxhello

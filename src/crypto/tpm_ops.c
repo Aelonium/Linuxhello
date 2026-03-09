@@ -277,8 +277,8 @@ static void lh_log_tpm_error(const char *fn, TSS2_RC rc)
             fn, Tss2_RC_Decode(rc), (unsigned)rc);
 }
 
-/* Convert TPM2B_ECC_POINT to DER SubjectPublicKeyInfo via OpenSSL */
-static int ecc_point_to_der(const TPM2B_ECC_POINT *pt,
+/* Convert TPMS_ECC_POINT to DER SubjectPublicKeyInfo via OpenSSL */
+static int ecc_point_to_der(const TPMS_ECC_POINT *pt,
                              uint8_t *der_buf, size_t *der_len)
 {
     EC_GROUP *grp = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
@@ -287,8 +287,8 @@ static int ecc_point_to_der(const TPM2B_ECC_POINT *pt,
     EC_POINT *ec_pt = EC_POINT_new(grp);
     if (!ec_pt) { EC_GROUP_free(grp); return -1; }
 
-    BIGNUM *x = BN_bin2bn(pt->point.x.buffer, pt->point.x.size, NULL);
-    BIGNUM *y = BN_bin2bn(pt->point.y.buffer, pt->point.y.size, NULL);
+    BIGNUM *x = BN_bin2bn(pt->x.buffer, pt->x.size, NULL);
+    BIGNUM *y = BN_bin2bn(pt->y.buffer, pt->y.size, NULL);
     if (!x || !y) goto fail;
 
     if (!EC_POINT_set_affine_coordinates(grp, ec_pt, x, y, NULL))
@@ -327,11 +327,42 @@ int lh_tpm_init(lh_tpm_ctx_t *ctx)
 {
     memset(ctx, 0, sizeof(*ctx));
 
-    TSS2_RC rc = Esys_Initialize(&ctx->ectx, NULL, NULL);
+    /*
+     * TCTI selection: prefer the kernel in-kernel resource manager
+     * (/dev/tpmrm0) over the default, which is tpm2-abrmd via D-Bus.
+     *
+     * Rationale: the daemon forks a child process per authentication
+     * request.  D-Bus connections are NOT fork-safe – after fork() the
+     * child cannot reliably establish a new D-Bus session, causing
+     * Esys_Initialize to fail with a "TPM init failed" error even when
+     * tpm2-abrmd is running.  The kernel device TCTI bypasses D-Bus
+     * entirely and is safe to open in a forked child.
+     *
+     * Fallback chain:
+     *   1. device:/dev/tpmrm0  – kernel RM, fork-safe, no D-Bus
+     *   2. NULL (default TCTI) – tpm2-abrmd, suitable for non-forking
+     *      callers such as lh-enroll
+     */
+    TSS2_TCTI_CONTEXT *tcti = NULL;
+    TSS2_RC trc = Tss2_TctiLdr_Initialize("device:/dev/tpmrm0", &tcti);
+    if (trc != TSS2_RC_SUCCESS) {
+        /* /dev/tpmrm0 unavailable – try abrmd via default TCTI */
+        tcti = NULL;
+    }
+
+    TSS2_RC rc = Esys_Initialize(&ctx->ectx, tcti, NULL);
+    if (tcti && rc != TSS2_RC_SUCCESS) {
+        /* Device TCTI loaded but Esys refused it – free and retry default */
+        Tss2_TctiLdr_Finalize(&tcti);
+        tcti = NULL;
+        rc = Esys_Initialize(&ctx->ectx, NULL, NULL);
+    }
     if (rc != TSS2_RC_SUCCESS) {
+        if (tcti) Tss2_TctiLdr_Finalize(&tcti);
         lh_log_tpm_error("Esys_Initialize", rc);
         return -1;
     }
+    /* tcti is now owned by ctx->ectx; do not free separately */
 
     TPMS_TIME_INFO *time_info = NULL;
     rc = Esys_ReadClock(ctx->ectx,
@@ -506,6 +537,35 @@ int lh_tpm_create_key(lh_tpm_ctx_t *ctx,
     }
 
     *out_handle = LH_TPM_HANDLE_BASE;
+
+    /*
+     * If this persistent handle is already occupied (e.g. from a previous
+     * enrollment that was disk-purged without revoking the TPM key), evict
+     * the stale object now so the new key can be persisted at this slot.
+     */
+    {
+        ESYS_TR stale = ESYS_TR_NONE;
+        TSS2_RC probe = Esys_TR_FromTPMPublic(ctx->ectx, *out_handle,
+                            ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
+                            &stale);
+        if (probe == TSS2_RC_SUCCESS && stale != ESYS_TR_NONE) {
+            fprintf(stderr,
+                    "[linuxhello] TPM handle 0x%08x already occupied "
+                    "(stale from previous enrollment) – evicting...\n",
+                    *out_handle);
+            ESYS_TR evicted = ESYS_TR_NONE;   /* must be non-NULL pointer */
+            TSS2_RC evict_rc =
+                Esys_EvictControl(ctx->ectx,
+                                  ESYS_TR_RH_OWNER, stale,
+                                  ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
+                                  *out_handle, &evicted);
+            if (evict_rc != TSS2_RC_SUCCESS)
+                lh_log_tpm_error("Esys_EvictControl (evict stale)", evict_rc);
+            /* Continue regardless – the EvictControl below will tell us
+               whether the slot is now free. */
+        }
+    }
+
     rc = Esys_EvictControl(ctx->ectx,
                            ESYS_TR_RH_OWNER, key_obj,
                            ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
@@ -670,6 +730,60 @@ int lh_tpm_delete_key(lh_tpm_ctx_t *ctx, TPM2_HANDLE persistent_handle)
     return 0;
 }
 
+/* ── lh_tpm_evict_range ──────────────────────────────────── */
+
+int lh_tpm_evict_range(lh_tpm_ctx_t *ctx,
+                        TPM2_HANDLE   base,
+                        TPM2_HANDLE   max,
+                        uint32_t     *out_evicted)
+{
+    if (out_evicted) *out_evicted = 0;
+
+    /*
+     * Paginate through TPM2_CAP_HANDLES starting at `base`.  The TPM
+     * returns handles in ascending order; we stop once all returned
+     * handles exceed `max` or the page is empty.
+     */
+    TPMI_YES_NO      more = TPM2_YES;
+    TPM2_HANDLE      next = base;
+
+    while (more == TPM2_YES) {
+        TPMS_CAPABILITY_DATA *cap = NULL;
+        TSS2_RC rc = Esys_GetCapability(ctx->ectx,
+                                         ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
+                                         TPM2_CAP_HANDLES,
+                                         next,
+                                         128,
+                                         &more,
+                                         &cap);
+        if (rc != TSS2_RC_SUCCESS) {
+            lh_log_tpm_error("Esys_GetCapability (evict_range)", rc);
+            return -1;
+        }
+
+        TPML_HANDLE *hl = &cap->data.handles;
+        if (hl->count == 0) { Esys_Free(cap); break; }
+
+        bool any_in_range = false;
+        for (uint32_t i = 0; i < hl->count; i++) {
+            TPM2_HANDLE h = hl->handle[i];
+            if (h < base) continue;
+            if (h > max)  { more = TPM2_NO; break; } /* past our range */
+            any_in_range = true;
+            if (lh_tpm_delete_key(ctx, h) == 0) {
+                if (out_evicted) (*out_evicted)++;
+            }
+        }
+
+        /* Advance past the last handle we saw to avoid re-fetching it */
+        next = hl->handle[hl->count - 1] + 1;
+        Esys_Free(cap);
+
+        if (!any_in_range || next > max) break;
+    }
+    return 0;
+}
+
 /* ── NVRAM lockout counter ───────────────────────────────── */
 
 int lh_tpm_nv_init_counter(lh_tpm_ctx_t *ctx, uint32_t user_slot)
@@ -680,7 +794,7 @@ int lh_tpm_nv_init_counter(lh_tpm_ctx_t *ctx, uint32_t user_slot)
     TPMS_NV_PUBLIC nv_pub = {
         .nvIndex    = nv_handle,
         .nameAlg    = TPM2_ALG_SHA256,
-        .attributes = (TPMA_NV_OWNERWRITE | TPMA_NV_OWNERREAD | TPMA_NV_COUNTER),
+        .attributes = (TPMA_NV_OWNERWRITE | TPMA_NV_OWNERREAD | (TPMA_NV)(TPM2_NT_COUNTER << 4)),
         .authPolicy = { .size = 0 },
         .dataSize   = sizeof(uint64_t),
     };

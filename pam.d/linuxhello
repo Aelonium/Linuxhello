@@ -1,52 +1,129 @@
-# /etc/pam.d/linuxhello
+# /etc/pam.d/linuxhello  –  LinuxHello PAM configuration snippet
 #
-# PAM configuration snippet for LinuxHello hardware-backed authentication.
+# ═══════════════════════════════════════════════════════════════════════════
+#  GOAL: PIN at login screen (select PIN -OR- password, like Windows Hello)
+#        NO PIN prompt for sudo / su (password only there)
+# ═══════════════════════════════════════════════════════════════════════════
 #
-# Usage – add ONE of the following patterns to your login PAM stack:
+# ── How the PIN / Password selector works ───────────────────────────────────
 #
-# Pattern A: LinuxHello with fallback to password (recommended for rollout)
-# --------------------------------------------------------------------------
-# Add this line BEFORE the existing @include common-auth line:
-#   auth  [success=1 new_authtok_reqd=ok ignore=ignore default=ignore]  \
-#               pam_linuxhello.so
-# This means: if linuxhello succeeds, skip 1 module (pam_unix); if it fails
-# or is unavailable, fall through to password auth.
+#  At the login screen the user sees a single prompt:
+#    "PIN (empty = use password instead):"
 #
-# Pattern B: LinuxHello-only (no password fallback) – hardened mode
-# --------------------------------------------------------------------------
-#   auth  required  pam_linuxhello.so nofallback
+#    • Type your PIN   → LinuxHello authenticates via TPM + IR biometric.
+#                        If it succeeds the login is complete; pam_unix is
+#                        never reached.
+#    • Press Enter blank → LinuxHello returns PAM_IGNORE.  The PAM stack
+#                        continues to pam_unix, which then asks for the
+#                        account password.  This is the Windows-Hello-style
+#                        "switch to password" flow.
 #
-# Example for /etc/pam.d/common-auth (Debian/Ubuntu):
-# -------------------------------------------------------------------------
-# auth  [success=1 new_authtok_reqd=ok ignore=ignore default=ignore] \
-#             pam_linuxhello.so
-# auth  [success=1 new_authtok_reqd=ok ignore=ignore default=die]    \
-#             pam_unix.so nullok_secure try_first_pass
-# auth  requisite  pam_deny.so
-# auth  required   pam_permit.so
+# ── Preventing PIN prompts in sudo / su ─────────────────────────────────────
 #
-# Example for /etc/pam.d/gdm-password (GNOME Display Manager):
-# -------------------------------------------------------------------------
-# auth  sufficient  pam_linuxhello.so
+#  Use the  skip_on_service=  option.  When the PAM service name (e.g. sudo,
+#  su-l, su) matches any entry in the comma-separated list, LinuxHello
+#  immediately returns PAM_IGNORE – no PIN prompt, no daemon connection.
+#  The next module in the sudo stack (pam_unix) handles the password check as
+#  normal.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+#  RECOMMENDED CONFIGURATION FOR LINUX MINT / UBUNTU
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# 1.  Replace /etc/pam.d/common-auth with the block below.
+#     (Back it up first: sudo cp /etc/pam.d/common-auth /etc/pam.d/common-auth.bak)
+#
+#     The key line is skip_on_service=sudo,su-l,su,su,cron,crond,polkit-1
+#     which prevents LinuxHello from intercepting privilege escalation tools.
+#
+# /etc/pam.d/common-auth
+# ─────────────────────────────────────────────────────────────────────────────
+# auth  [success=done new_authtok_reqd=ok ignore=ignore auth_err=die default=ignore] \
+#         pam_linuxhello.so  skip_on_service=sudo,su-l,su,cron,crond,polkit-1
+# auth  [success=done new_authtok_reqd=ok ignore=ignore default=die] \
+#         pam_unix.so nullok_secure try_first_pass
+# auth  requisite   pam_deny.so
+# auth  required    pam_permit.so
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Explanation of control flags:
+#   success=done       if this module succeeds, stop processing auth modules
+#                      (skip pam_unix entirely – no second password prompt)
+#   new_authtok_reqd=ok  pass through for password-expiry handling
+#   ignore=ignore      if LinuxHello returns PAM_IGNORE (no credential, service
+#                      excluded, or user pressed Enter blank), try next module
+#   auth_err=die       if LinuxHello returns PAM_AUTH_ERR (wrong PIN entered,
+#                      biometric rejected), stop immediately with a hard failure.
+#                      This prevents the double-prompt: wrong-PIN must NEVER fall
+#                      through to pam_unix and show a password prompt.
+#   default=ignore     on any other return (TPM unavailable etc.) try next module
+#
+#
+# 2.  /etc/pam.d/sudo  –  keep this as password-only; do NOT add LinuxHello.
+#     On a default Ubuntu/Mint install it looks like:
+#
+# /etc/pam.d/sudo
+# ─────────────────────────────────────────────────────────────────────────────
 # @include common-auth
+# @include common-account
+# @include common-session-noninteractive
+# ─────────────────────────────────────────────────────────────────────────────
+#     Because common-auth now has skip_on_service=sudo, LinuxHello is silently
+#     bypassed for sudo and the terminal only ever asks for the account password.
 #
-# Account management (check enrollment):
-# -------------------------------------------------------------------------
-# account  [success=1 default=ignore]  pam_linuxhello.so
 #
-# ── Options ──────────────────────────────────────────────────────────────────
-# fallback     (default) Allow fallback to the next auth module if LinuxHello
-#              is unavailable or user has no enrolled credential.
-# nofallback   Hard failure if LinuxHello credential is absent.
-#              Use only after all users have been enrolled.
-# debug        Log verbose debug messages to syslog (auth facility).
+# 3.  LightDM (Linux Mint default greeter)
 #
-# ── Notes ─────────────────────────────────────────────────────────────────────
-# * sudo: Add a separate stanza to /etc/pam.d/sudo if you want LinuxHello
-#   for privilege escalation (not recommended unless all admins are enrolled).
-# * Screen unlock (GDM/SDDM): The display manager's PAM profile
-#   (e.g., /etc/pam.d/gdm-password, /etc/pam.d/sddm) should be updated.
+#     LightDM reads /etc/pam.d/lightdm (and lightdm-autologin).
+#     Add LinuxHello ABOVE the @include common-auth line:
+#
+# /etc/pam.d/lightdm   (partial)
+# ─────────────────────────────────────────────────────────────────────────────
+# auth  [success=done new_authtok_reqd=ok ignore=ignore auth_err=die default=ignore] \
+#         pam_linuxhello.so
+# @include common-auth
+# @include common-account
+# session required pam_loginuid.so
+# @include common-session
+# ─────────────────────────────────────────────────────────────────────────────
+#     Note: no skip_on_service needed here because /etc/pam.d/lightdm is not
+#     shared with sudo; the common-auth include already excludes sudo above.
+#
+#
+# 4.  GDM (GNOME Display Manager) – if used instead of LightDM
+#
+# /etc/pam.d/gdm-password   (partial)
+# ─────────────────────────────────────────────────────────────────────────────
+# auth  [success=done new_authtok_reqd=ok ignore=ignore auth_err=die default=ignore] \
+#         pam_linuxhello.so
+# @include common-auth
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# ── Options reference ────────────────────────────────────────────────────────
+#
+# fallback               (default) Return PAM_IGNORE on any error so the next
+#                        auth module can try.
+# nofallback             Hard-fail (PAM_AUTH_ERR) when LinuxHello cannot
+#                        authenticate.  Use only after ALL users are enrolled.
+# debug                  Write detailed progress to syslog auth facility.
+# skip_on_service=LIST   Comma-separated list of PAM service names for which
+#                        LinuxHello immediately returns PAM_IGNORE without
+#                        prompting.  Example:
+#                          skip_on_service=sudo,su-l,su,cron,polkit-1
+#
+# ── Account stanza (enrollment check) ───────────────────────────────────────
+#
+# Optionally add to /etc/pam.d/common-account to gate logins to enrolled users:
+#   account  [success=done default=ignore]  pam_linuxhello.so
+#
+# ── Notes ────────────────────────────────────────────────────────────────────
 # * The linuxhello daemon (lhd) must be running:
-#     systemctl enable --now linuxhello
+#     sudo systemctl enable --now linuxhello
+# * Enroll users with:
+#     sudo lh-enroll enroll --user <username>
+# * Check status with:
+#     sudo lh-enroll status --user <username>
+# * If unsure which greeter/DM is running on your system:
+#     systemctl status display-manager
 #
-auth  sufficient  pam_linuxhello.so
+auth  [success=done new_authtok_reqd=ok ignore=ignore auth_err=die default=ignore]  pam_linuxhello.so

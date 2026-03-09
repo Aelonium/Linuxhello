@@ -21,6 +21,7 @@
 #  include <tss2/tss2_esys.h>
 #  include <tss2/tss2_tpm2_types.h>
 #  include <tss2/tss2_rc.h>
+#  include <tss2/tss2_tctildr.h>
 #else
 /* Minimal type stubs so this header compiles without tpm2-tss installed */
 typedef uint32_t TPM2_HANDLE;
@@ -158,6 +159,26 @@ int lh_tpm_verify_signature(const lh_pubkey_t   *pubkey,
  * remove the NVRAM lockout index.  Used during credential revocation.
  */
 int lh_tpm_delete_key(lh_tpm_ctx_t *ctx, TPM2_HANDLE persistent_handle);
+
+/**
+ * lh_tpm_evict_range – Evict all LinuxHello persistent handles in the
+ * range [base..max] from the TPM owner hierarchy.
+ *
+ * Handles outside that range are left untouched.  Use this to clear
+ * stale keys after a failed enroll/revoke cycle, passing
+ * LH_TPM_HANDLE_BASE and LH_TPM_HANDLE_MAX to sweep the full slot space.
+ *
+ * @param ctx          Initialised TPM context
+ * @param base         First handle to consider (inclusive)
+ * @param max          Last handle to consider (inclusive)
+ * @param out_evicted  Receives the count of handles successfully evicted
+ *
+ * Returns 0 on success (including "nothing found"), -1 on TPM error.
+ */
+int lh_tpm_evict_range(lh_tpm_ctx_t *ctx,
+                        TPM2_HANDLE   base,
+                        TPM2_HANDLE   max,
+                        uint32_t     *out_evicted);
 
 /* ── NVRAM lockout counter ───────────────────────────────── */
 

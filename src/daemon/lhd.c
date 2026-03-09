@@ -30,7 +30,7 @@
 
 #include "../crypto/tpm_ops.h"
 #include "../crypto/challenge.h"
-#include "../biometric/fprintd_client.h"
+#include "../biometric/ir_face.h"
 #include "../storage/storage.h"
 
 /* ── Internal helpers ────────────────────────────────────── */
@@ -147,12 +147,15 @@ void lhd_handle_auth_request(int client_fd, bool debug)
      */
     bool bio_ok = false;
     if (cred.biometric_enrolled &&
-        strcmp(cred.biometric_type, "fingerprint") == 0)
+        strcmp(cred.biometric_type, "face_ir") == 0)
     {
-        lh_bio_result_t bio = lh_bio_verify(username);
+        lh_bio_result_t bio = lh_face_verify(username,
+                                              cred.pubkey_der,
+                                              cred.pubkey_der_len);
         bio_ok = (bio == LH_BIO_OK);
         if (debug)
-            syslog(LOG_DEBUG, "linuxhello daemon: biometric result %d for '%s'",
+            syslog(LOG_DEBUG,
+                   "linuxhello daemon: IR face result %d for '%s'",
                    (int)bio, username);
     }
 
@@ -192,7 +195,23 @@ void lhd_handle_auth_request(int client_fd, bool debug)
 
     if (cred.tpm_available && !cred.degraded_mode) {
         lh_tpm_ctx_t tpm;
-        if (lh_tpm_init(&tpm) != 0) {
+
+        /*
+         * Guard lh_tpm_init with SIGALRM so a hung TCTI connection
+         * (e.g., tpm2-abrmd busy) cannot block this child indefinitely.
+         * We use SIG_IGN so the alarm interrupts blocking I/O via EINTR
+         * without killing the process.
+         */
+        struct sigaction sa_old, sa_alrm;
+        memset(&sa_alrm, 0, sizeof(sa_alrm));
+        sa_alrm.sa_handler = SIG_IGN;
+        sigaction(SIGALRM, &sa_alrm, &sa_old);
+        alarm(10);
+        int tpm_init_rc = lh_tpm_init(&tpm);
+        alarm(0);
+        sigaction(SIGALRM, &sa_old, NULL);
+
+        if (tpm_init_rc != 0) {
             syslog(LOG_ERR,
                    "linuxhello daemon: TPM init failed for user '%s'", username);
             send_auth_result(client_fd, LH_ERR_TPM, 0);

@@ -17,7 +17,7 @@ target_link_libraries(test_crypto PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 if(HAVE_TPM2)
     target_include_directories(test_crypto PRIVATE ${TSS2_ESYS_INCLUDE_DIRS})
     target_link_libraries(test_crypto PRIVATE
-        ${TSS2_ESYS_LIBRARIES} ${TSS2_RC_LIBRARIES})
+        ${TSS2_ESYS_LIBRARIES} ${TSS2_RC_LIBRARIES} ${TSS2_TCTILDR_LIBRARIES})
     target_compile_definitions(test_crypto PRIVATE LH_HAVE_TPM2=1)
 else()
     target_compile_definitions(test_crypto PRIVATE LH_NO_TPM2=1)

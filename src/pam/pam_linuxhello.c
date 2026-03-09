@@ -39,6 +39,9 @@
 #include <security/pam_modules.h>
 #include <security/pam_ext.h>
 
+#include <stdbool.h>
+#include <syslog.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,25 +55,78 @@
 
 /* ── Module option defaults ──────────────────────────────── */
 
-#define LH_PAM_OPT_FALLBACK    "fallback"   /* allow password fallback      */
-#define LH_PAM_OPT_NOFALLBACK  "nofallback" /* no fallback (hardened mode)  */
-#define LH_PAM_OPT_DEBUG       "debug"
+#define LH_PAM_OPT_FALLBACK        "fallback"        /* allow password fallback      */
+#define LH_PAM_OPT_NOFALLBACK      "nofallback"      /* no fallback (hardened mode)  */
+#define LH_PAM_OPT_DEBUG           "debug"
+#define LH_PAM_OPT_SKIP_SERVICE    "skip_on_service=" /* comma-separated service list */
+
+/* Maximum number of service names that can be excluded */
+#define LH_MAX_SKIP_SERVICES  16
 
 typedef struct lh_pam_opts {
-    bool allow_fallback;
-    bool debug;
+    bool  allow_fallback;
+    bool  debug;
+    /* Services for which LinuxHello PIN auth is silently skipped.
+     * Typical use: skip_on_service=sudo,su-l,su,su
+     * This allows pam_linuxhello to live in common-auth without
+     * prompting for a PIN when the user runs sudo. */
+    char  skip_services[LH_MAX_SKIP_SERVICES][64];
+    int   skip_service_count;
 } lh_pam_opts_t;
 
 static void parse_opts(int argc, const char **argv, lh_pam_opts_t *o)
 {
-    o->allow_fallback = true; /* default: fallback to password allowed */
-    o->debug          = false;
+    o->allow_fallback      = true; /* default: fallback to password allowed */
+    o->debug               = false;
+    o->skip_service_count  = 0;
+
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], LH_PAM_OPT_NOFALLBACK) == 0)
             o->allow_fallback = false;
         else if (strcmp(argv[i], LH_PAM_OPT_DEBUG) == 0)
             o->debug = true;
+        else if (strncmp(argv[i], LH_PAM_OPT_SKIP_SERVICE,
+                         strlen(LH_PAM_OPT_SKIP_SERVICE)) == 0)
+        {
+            /* Parse comma-separated list after the '=' */
+            const char *list = argv[i] + strlen(LH_PAM_OPT_SKIP_SERVICE);
+            char buf[256];
+            strncpy(buf, list, sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = '\0';
+
+            char *tok = strtok(buf, ",");
+            while (tok && o->skip_service_count < LH_MAX_SKIP_SERVICES) {
+                strncpy(o->skip_services[o->skip_service_count],
+                        tok,
+                        sizeof(o->skip_services[0]) - 1);
+                o->skip_services[o->skip_service_count]
+                    [sizeof(o->skip_services[0]) - 1] = '\0';
+                o->skip_service_count++;
+                tok = strtok(NULL, ",");
+            }
+        }
     }
+}
+
+/*
+ * service_is_skipped – returns true if the PAM service name matches any
+ * entry in the skip_services list.
+ */
+static bool service_is_skipped(pam_handle_t *pamh, const lh_pam_opts_t *o)
+{
+    if (o->skip_service_count == 0)
+        return false;
+
+    const char *svc = NULL;
+    if (pam_get_item(pamh, PAM_SERVICE, (const void **)&svc) != PAM_SUCCESS
+        || !svc)
+        return false;
+
+    for (int i = 0; i < o->skip_service_count; i++) {
+        if (strcmp(svc, o->skip_services[i]) == 0)
+            return true;
+    }
+    return false;
 }
 
 /* ── IPC helpers ─────────────────────────────────────────── */
@@ -134,6 +190,24 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh,
     if (pam_rc != PAM_SUCCESS || !username || !*username) {
         pam_syslog(pamh, LOG_ERR, "linuxhello: failed to get username");
         return opts.allow_fallback ? PAM_IGNORE : PAM_AUTH_ERR;
+    }
+
+    /*
+     * ── 1a. Service exclusion check ────────────────────────────────
+     *
+     * When skip_on_service=sudo,su-l,... is configured, silently skip
+     * LinuxHello for those PAM services so that 'sudo' continues to use
+     * the standard password prompt without also asking for a PIN.
+     */
+    if (service_is_skipped(pamh, &opts)) {
+        if (opts.debug) {
+            const char *svc = NULL;
+            pam_get_item(pamh, PAM_SERVICE, (const void **)&svc);
+            pam_syslog(pamh, LOG_DEBUG,
+                       "linuxhello: skipping for service '%s'",
+                       svc ? svc : "(unknown)");
+        }
+        return PAM_IGNORE;
     }
 
     if (opts.debug)
@@ -214,8 +288,21 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh,
      * Then prompt for PIN – the daemon accepts whichever comes first.
      */
     if (conv) {
+        /*
+         * Show a single prompt that accepts either the LinuxHello PIN or
+         * nothing (empty Enter) to fall through to the next PAM module
+         * (typically pam_unix password auth).  This gives the user a
+         * Windows-Hello-like choice at the login screen:
+         *   – type PIN  → LinuxHello authenticates
+         *   – press Enter with no input → PAM_IGNORE sent, pam_unix
+         *     continues and prompts for the account password
+         *
+         * For display managers (GDM, LightDM) the greeter must be
+         * configured to show a second password field when LinuxHello
+         * returns IGNORE; see pam.d/linuxhello for stack examples.
+         */
         struct pam_message msg  = { PAM_PROMPT_ECHO_OFF,
-                                    "LinuxHello PIN (or Enter for biometric): " };
+                                    "PIN (empty = use password instead): " };
         const struct pam_message *msgp = &msg;
         struct pam_response *resp = NULL;
 
@@ -224,6 +311,23 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh,
         {
             pin_token = resp->resp; /* will be freed after use */
         }
+    }
+
+    /*
+     * If the user submitted an empty response, treat it as "use password
+     * instead": skip LinuxHello entirely so the next module (pam_unix)
+     * handles authentication.
+     */
+    if (!pin_token || !*pin_token) {
+        if (pin_token) {
+            free((void *)pin_token);
+            pin_token = NULL;
+        }
+        close(daemon_fd);
+        if (opts.debug)
+            pam_syslog(pamh, LOG_DEBUG,
+                       "linuxhello: empty PIN input – deferring to next module");
+        return PAM_IGNORE;
     }
 
     /*
@@ -252,7 +356,16 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh,
         if (pin_token) free((void *)pin_token);
         return opts.allow_fallback ? PAM_IGNORE : PAM_AUTH_ERR;
     }
-
+    /*
+     * Remember whether the user actually typed a PIN before we zero it.
+     * This drives the error-return policy below: if a non-empty PIN was
+     * entered and the daemon rejects it, we return PAM_AUTH_ERR so the
+     * PAM stack fails immediately.  We must NOT return PAM_IGNORE in that
+     * case because PAM_IGNORE causes the next module (pam_unix) to run,
+     * which would prompt for a password and give the appearance of a
+     * double-prompt even after the user correctly entered their PIN.
+     */
+    bool pin_was_entered = (pin_token != NULL && *pin_token != '\0');
     /* Securely zero the PIN token once sent (capture length before zero) */
     if (pin_token) {
         size_t pin_len = strlen(pin_token);
@@ -295,12 +408,35 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh,
         pam_syslog(pamh, LOG_WARNING,
                    "linuxhello: authentication failed for user %s "
                    "(%d attempts remaining)", username, result.attempts);
+        /*
+         * The user entered a PIN that the TPM rejected.  Return
+         * PAM_AUTH_ERR unconditionally so the PAM stack stops here and
+         * does NOT fall through to pam_unix.  Falling through would show
+         * a second password prompt, which is the exact double-prompt bug
+         * we are fixing.  PAM_IGNORE is reserved for the empty-PIN case
+         * ("use password instead") handled earlier in the function.
+         */
+        if (pin_was_entered)
+            return PAM_AUTH_ERR;
         return opts.allow_fallback ? PAM_IGNORE : PAM_AUTH_ERR;
+
+    case LH_ERR_TPM:
+        pam_syslog(pamh, LOG_WARNING,
+                   "linuxhello: TPM unavailable for user %s – "
+                   "falling back to next auth module", username);
+        /*
+         * TPM hardware failure is not the user's fault.  Allow fallback
+         * to password auth so the user can still log in even when the
+         * TPM is temporarily unavailable (e.g., after a firmware update).
+         */
+        return opts.allow_fallback ? PAM_IGNORE : PAM_AUTHINFO_UNAVAIL;
 
     default:
         pam_syslog(pamh, LOG_ERR,
                    "linuxhello: unknown result %d for user %s",
                    result.result, username);
+        if (pin_was_entered)
+            return PAM_AUTH_ERR;
         return opts.allow_fallback ? PAM_IGNORE : PAM_AUTH_ERR;
     }
 }

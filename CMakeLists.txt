@@ -1,14 +1,18 @@
 cmake_minimum_required(VERSION 3.16)
-project(LinuxHello VERSION 0.1.0 LANGUAGES C)
+project(LinuxHello VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ── Compiler flags ────────────────────────────────────────────────────────────
 add_compile_options(
     -Wall -Wextra -Wpedantic
     -Wformat=2 -Wformat-security
-    -Wstrict-prototypes -Wmissing-prototypes
+    # C-only: -Wstrict-prototypes / -Wmissing-prototypes cause errors in C++ mode
+    $<$<COMPILE_LANGUAGE:C>:-Wstrict-prototypes>
+    $<$<COMPILE_LANGUAGE:C>:-Wmissing-prototypes>
     -fstack-protector-strong
     -D_FORTIFY_SOURCE=2
     -fPIE
@@ -22,12 +26,16 @@ find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
 
 # tpm2-tss ESAPI (optional: TPM 2.0 support)
-pkg_check_modules(TSS2_ESYS  tss2-esys)
-pkg_check_modules(TSS2_RC    tss2-rc)
+pkg_check_modules(TSS2_ESYS    tss2-esys)
+pkg_check_modules(TSS2_RC      tss2-rc)
+pkg_check_modules(TSS2_TCTILDR tss2-tctildr)
 
-# GLib/GIO (optional: fprintd D-Bus client)
+# GLib/GIO (kept for reference; no longer used for biometrics)
 pkg_check_modules(GLIB  glib-2.0)
 pkg_check_modules(GIO   gio-2.0)
+
+# OpenCV 4 (optional: IR face recognition)
+pkg_check_modules(OPENCV4 opencv4)
 
 # libpam (required: PAM module)
 find_library(PAM_LIBRARY pam)
@@ -45,10 +53,18 @@ endif()
 
 if(GLIB_FOUND AND GIO_FOUND)
     set(HAVE_GLIB TRUE)
-    message(STATUS "GLib/GIO (fprintd D-Bus): enabled")
+    message(STATUS "GLib/GIO: found (not used)")
 else()
     set(HAVE_GLIB FALSE)
-    message(STATUS "GLib/GIO (fprintd D-Bus): NOT found – biometric disabled")
+    message(STATUS "GLib/GIO: not found")
+endif()
+
+if(OPENCV4_FOUND)
+    set(HAVE_OPENCV TRUE)
+    message(STATUS "OpenCV 4 (IR face recognition): enabled")
+else()
+    set(HAVE_OPENCV FALSE)
+    message(STATUS "OpenCV 4: NOT found – biometric support disabled")
 endif()
 
 if(PAM_LIBRARY AND PAM_INCLUDE_DIR)
@@ -82,6 +98,7 @@ if(HAVE_TPM2)
     target_link_libraries(lh_crypto PUBLIC
         ${TSS2_ESYS_LIBRARIES}
         ${TSS2_RC_LIBRARIES}
+        ${TSS2_TCTILDR_LIBRARIES}
     )
     target_compile_options(lh_crypto PUBLIC ${TSS2_ESYS_CFLAGS_OTHER})
 else()
@@ -101,26 +118,21 @@ target_include_directories(lh_storage PUBLIC
 )
 target_link_libraries(lh_storage PUBLIC OpenSSL::Crypto)
 
-# Biometric library (requires GLib)
-if(HAVE_GLIB)
-    set(BIO_SOURCES
-        src/biometric/fprintd_client.c
-    )
-    add_library(lh_bio STATIC ${BIO_SOURCES})
+# Biometric library – IR face recognition via OpenCV
+if(HAVE_OPENCV)
+    add_library(lh_bio STATIC src/biometric/ir_face.cpp)
     target_include_directories(lh_bio PUBLIC
         src/common
         src/biometric
-        ${GLIB_INCLUDE_DIRS}
-        ${GIO_INCLUDE_DIRS}
+        ${OPENCV4_INCLUDE_DIRS}
+        ${OPENSSL_INCLUDE_DIR}
     )
     target_link_libraries(lh_bio PUBLIC
-        ${GLIB_LIBRARIES}
-        ${GIO_LIBRARIES}
+        ${OPENCV4_LIBRARIES}
+        OpenSSL::Crypto
     )
-    target_compile_options(lh_bio PUBLIC
-        ${GLIB_CFLAGS_OTHER}
-        ${GIO_CFLAGS_OTHER}
-    )
+    target_compile_options(lh_bio PUBLIC ${OPENCV4_CFLAGS_OTHER})
+    target_compile_definitions(lh_bio PUBLIC LH_HAVE_FACE=1)
 else()
     # Provide a stub library so daemon and enroll tool can still link
     add_library(lh_bio STATIC src/biometric/fprintd_stub.c)
@@ -163,7 +175,11 @@ if(HAVE_PAM)
         set(PAM_MODULE_DIR "/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu/security"
             CACHE PATH "PAM security modules directory")
     endif()
-    install(TARGETS pam_linuxhello DESTINATION ${PAM_MODULE_DIR})
+    install(TARGETS pam_linuxhello
+        DESTINATION ${PAM_MODULE_DIR}
+        PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
+                    GROUP_READ GROUP_EXECUTE
+                    WORLD_READ WORLD_EXECUTE)
 else()
     message(STATUS "PAM module will not be built (libpam not found)")
 endif()

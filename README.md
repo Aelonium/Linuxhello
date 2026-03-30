@@ -143,7 +143,7 @@ sudo lh-enroll rotate --user alice
 
 ## PAM Configuration
 
-Replace `/etc/pam.d/common-auth` (Debian/Ubuntu/Linux Mint) with:
+Replace the `auth` lines in `/etc/pam.d/common-auth` (Debian/Ubuntu/Linux Mint) with:
 
 ```
 # LinuxHello: PIN replaces password (recommended for initial rollout):

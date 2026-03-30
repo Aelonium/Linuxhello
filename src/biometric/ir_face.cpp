@@ -419,7 +419,7 @@ static bool open_ir_camera(cv::VideoCapture &cap)
 
     /* 2. Scan /dev/video0 .. /dev/video<max> */
     for (int i = 0; i <= LH_IR_DEVICE_MAX; ++i) {
-        char dev_path[32];
+        char dev_path[64];
         snprintf(dev_path, sizeof(dev_path), "/dev/video%d", i);
 
         /* Skip the default device – already tried above */
@@ -448,7 +448,7 @@ static bool open_ir_camera(cv::VideoCapture &cap)
 
     /* 4. Last resort: try any device that opens at all */
     for (int i = 0; i <= LH_IR_DEVICE_MAX; ++i) {
-        char dev_path[32];
+        char dev_path[64];
         snprintf(dev_path, sizeof(dev_path), "/dev/video%d", i);
         if (try_open_device(cap, dev_path)) {
             fprintf(stderr,

@@ -373,22 +373,92 @@ static int decrypt_embedding(const char *path,
  * Camera helper
  * ════════════════════════════════════════════════════════════ */
 
-static bool open_ir_camera(cv::VideoCapture &cap)
+/*
+ * try_open_device – attempt to open a specific V4L2 device path for
+ * IR (greyscale) capture.  Returns true if the device opens successfully
+ * and we can set the GREY pixel format.
+ */
+static bool try_open_device(cv::VideoCapture &cap, const char *dev_path)
 {
-    /*
-     * Open by device PATH, not integer index.
-     * cap.open(N) lets OpenCV enumerate only capture-capable nodes and
-     * pick the Nth one – meaning index 2 does NOT reliably map to
-     * /dev/video2.  Using the path string bypasses that enumeration and
-     * opens exactly the node we want (the GREY/IR stream).
-     */
-    if (!cap.open(LH_IR_DEVICE, cv::CAP_V4L2)) return false;
+    if (access(dev_path, F_OK) != 0) return false;
+    if (!cap.open(dev_path, cv::CAP_V4L2)) return false;
     /* Request IR (greyscale) format and known resolution */
     cap.set(cv::CAP_PROP_FOURCC,
             cv::VideoWriter::fourcc('G','R','E','Y'));
     cap.set(cv::CAP_PROP_FRAME_WIDTH,  640);
     cap.set(cv::CAP_PROP_FRAME_HEIGHT, 360);
     return true;
+}
+
+/*
+ * open_ir_camera – open the IR camera with auto-detection.
+ *
+ * Strategy:
+ *   1. Try the default device (LH_IR_DEVICE, typically /dev/video2) first
+ *      for backward compatibility.
+ *   2. If that fails, scan /dev/video0 through /dev/video<LH_IR_DEVICE_MAX>
+ *      and try each one.  For each device that opens, attempt to read a
+ *      single frame and check that it is greyscale (1 channel) – a strong
+ *      indicator of an IR camera rather than an RGB webcam.
+ *   3. Use the first device that produces a greyscale frame.
+ *
+ * This auto-detection allows LinuxHello to find the IR camera regardless
+ * of which /dev/video* node the kernel assigned it to.
+ */
+static bool open_ir_camera(cv::VideoCapture &cap)
+{
+    /* 1. Try the configured default device first */
+    if (try_open_device(cap, LH_IR_DEVICE)) {
+        /* Quick check: read one frame to see if it's greyscale */
+        cv::Mat test;
+        if (cap.read(test) && !test.empty() && test.channels() == 1)
+            return true;
+        /* Device opened but is not greyscale; close and continue scanning */
+        cap.release();
+    }
+
+    /* 2. Scan /dev/video0 .. /dev/video<max> */
+    for (int i = 0; i <= LH_IR_DEVICE_MAX; ++i) {
+        char dev_path[32];
+        snprintf(dev_path, sizeof(dev_path), "/dev/video%d", i);
+
+        /* Skip the default device – already tried above */
+        if (strcmp(dev_path, LH_IR_DEVICE) == 0) continue;
+
+        if (!try_open_device(cap, dev_path)) continue;
+
+        /* Check for greyscale frames (IR camera indicator) */
+        cv::Mat test;
+        if (cap.read(test) && !test.empty() && test.channels() == 1) {
+            fprintf(stderr,
+                    "[linuxhello/face] Auto-detected IR camera at %s\n",
+                    dev_path);
+            return true;
+        }
+        cap.release();
+    }
+
+    /*
+     * 3. Fallback: try the default device again without the greyscale
+     *    check.  Some IR cameras deliver BGR frames that we convert to
+     *    grey later in the pipeline.
+     */
+    if (try_open_device(cap, LH_IR_DEVICE))
+        return true;
+
+    /* 4. Last resort: try any device that opens at all */
+    for (int i = 0; i <= LH_IR_DEVICE_MAX; ++i) {
+        char dev_path[32];
+        snprintf(dev_path, sizeof(dev_path), "/dev/video%d", i);
+        if (try_open_device(cap, dev_path)) {
+            fprintf(stderr,
+                    "[linuxhello/face] Using fallback camera at %s "
+                    "(not confirmed greyscale)\n", dev_path);
+            return true;
+        }
+    }
+
+    return false;
 }
 
 /* Convert captured frame to single-channel greyscale regardless of
@@ -525,13 +595,14 @@ int lh_face_enroll(const char    *username,
 /**
  * lh_ir_camera_test – Quick pre-enrollment sanity check for the IR camera.
  *
- * Opens the V4L2 device, tries to pull up to LH_CAM_TEST_FRAMES frames
- * within LH_CAM_TEST_TIMEOUT_MS milliseconds, then closes the device.
- * Does NOT check for a face – only verifies that the camera delivers pixels.
+ * Uses the same auto-detection logic as open_ir_camera(): tries the
+ * configured default device first, then scans /dev/video0 through
+ * /dev/video<LH_IR_DEVICE_MAX>.  Verifies that at least one device can
+ * deliver frames.
  *
  * Returns:
  *   LH_FACE_OK          device opened and at least one frame received
- *   LH_FACE_ERR_DEVICE  device node absent or OpenCV could not open it
+ *   LH_FACE_ERR_DEVICE  no suitable device found
  *   LH_FACE_ERR_NO_FRAME device opened but no frame arrived (driver issue)
  */
 static constexpr int LH_CAM_TEST_FRAMES     = 10;
@@ -540,35 +611,25 @@ static constexpr int LH_CAM_TEST_TIMEOUT_MS = 3000; /* 3 seconds */
 int lh_ir_camera_test(void)
 {
     fprintf(stderr,
-            "[lh_ir_camera_test] probing %s ...\n", LH_IR_DEVICE);
+            "[lh_ir_camera_test] probing for IR camera "
+            "(default %s, scanning /dev/video0..%d) ...\n",
+            LH_IR_DEVICE, LH_IR_DEVICE_MAX);
 
-    /* 1. Check the device node exists at the filesystem level */
-    if (access(LH_IR_DEVICE, F_OK) != 0) {
-        fprintf(stderr,
-                "[lh_ir_camera_test] ERROR: device node %s not found.\n"
-                "  Hints:\n"
-                "    ls -la /dev/video*          – list available video nodes\n"
-                "    sudo dmesg | grep -i uvc    – check USB camera driver\n"
-                "    sudo dmesg | grep -i video  – broader driver output\n",
-                LH_IR_DEVICE);
-        return LH_FACE_ERR_DEVICE;
-    }
-
-    /* 2. Try to open the camera with OpenCV / V4L2 */
+    /* 1. Try to open the camera via auto-detection */
     cv::VideoCapture cap;
     if (!open_ir_camera(cap)) {
         fprintf(stderr,
-                "[lh_ir_camera_test] ERROR: could not open %s via V4L2.\n"
+                "[lh_ir_camera_test] ERROR: no suitable camera found.\n"
                 "  Hints:\n"
-                "    v4l2-ctl --list-devices           – list V4L2 devices\n"
-                "    v4l2-ctl -d %s --list-formats-ext – supported formats\n"
-                "    sudo usermod -aG video $USER      – add user to video group\n",
-                LH_IR_DEVICE, LH_IR_DEVICE);
+                "    ls -la /dev/video*              – list available video nodes\n"
+                "    v4l2-ctl --list-devices         – list V4L2 devices\n"
+                "    sudo dmesg | grep -iE 'uvc|video|camera' – driver output\n"
+                "    sudo usermod -aG video $USER    – add user to video group\n");
         return LH_FACE_ERR_DEVICE;
     }
 
     /*
-     * 3. Attempt to read frames within the timeout window.
+     * 2. Attempt to read frames within the timeout window.
      *    Some cameras need a few frames to warm up before delivering
      *    valid data, so we try up to LH_CAM_TEST_FRAMES times.
      */
@@ -599,20 +660,17 @@ int lh_ir_camera_test(void)
 
     if (!got_frame) {
         fprintf(stderr,
-                "[lh_ir_camera_test] ERROR: device opened but no valid frame "
+                "[lh_ir_camera_test] ERROR: camera opened but no valid frame "
                 "received in %d ms (%d attempt(s)).\n"
                 "  Hints:\n"
                 "    Check IR illuminator LEDs are on during capture.\n"
-                "    Try: v4l2-ctl -d %s --stream-mmap=3\n"
-                "    Check dmesg for timeout or underrun messages.\n"
-                "    If the device index is wrong, update LH_IR_DEVICE in "
-                "ir_face.h\n",
-                LH_CAM_TEST_TIMEOUT_MS, attempts, LH_IR_DEVICE);
+                "    Check dmesg for timeout or underrun messages.\n",
+                LH_CAM_TEST_TIMEOUT_MS, attempts);
         return LH_FACE_ERR_NO_FRAME;
     }
 
     fprintf(stderr,
-            "[lh_ir_camera_test] IR camera %s is functional.\n", LH_IR_DEVICE);
+            "[lh_ir_camera_test] IR camera is functional.\n");
     return LH_FACE_OK;
 }
 

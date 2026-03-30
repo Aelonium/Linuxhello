@@ -28,9 +28,9 @@
  * Install:
  *   cp pam_linuxhello.so /lib/$(uname -m)-linux-gnu/security/
  *
- * PAM stack snippet (e.g., /etc/pam.d/gdm-password):
- *   auth  sufficient  pam_linuxhello.so
- *   auth  required    pam_unix.so try_first_pass
+ * PAM stack snippet (e.g., /etc/pam.d/common-auth):
+ *   auth  [success=done new_authtok_reqd=ok ignore=ignore auth_err=die default=ignore]  pam_linuxhello.so
+ *   auth  [success=done new_authtok_reqd=ok ignore=ignore default=die]  pam_unix.so nullok_secure try_first_pass
  */
 
 #define PAM_SM_AUTH

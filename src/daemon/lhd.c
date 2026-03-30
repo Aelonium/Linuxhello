@@ -30,7 +30,9 @@
 
 #include "../crypto/tpm_ops.h"
 #include "../crypto/challenge.h"
+#ifdef LH_HAVE_FACE
 #include "../biometric/ir_face.h"
+#endif
 #include "../storage/storage.h"
 
 /* ── Internal helpers ────────────────────────────────────── */
@@ -137,15 +139,17 @@ void lhd_handle_auth_request(int client_fd, bool debug)
 
     /* ── 5. Biometric gate (parallel with PIN prompt on client side) */
     /*
-     * If the user has an enrolled fingerprint, we ask fprintd to verify
-     * now.  If biometric succeeds we proceed without requiring the PIN.
-     * If biometric fails/times out we fall through to PIN verification.
+     * If the user has an enrolled face template, we try IR face
+     * verification now.  If biometric succeeds we proceed without
+     * requiring the PIN.  If biometric fails/times out we fall through
+     * to PIN verification.
      *
      * IMPORTANT: The biometric result is used only as an "unlock gesture"
      * to decide whether to proceed.  The actual secret is the TPM key;
      * biometric success merely authorises the TPM operation.
      */
     bool bio_ok = false;
+#ifdef LH_HAVE_FACE
     if (cred.biometric_enrolled &&
         strcmp(cred.biometric_type, "face_ir") == 0)
     {
@@ -158,6 +162,12 @@ void lhd_handle_auth_request(int client_fd, bool debug)
                    "linuxhello daemon: IR face result %d for '%s'",
                    (int)bio, username);
     }
+#else
+    if (cred.biometric_enrolled && debug)
+        syslog(LOG_DEBUG,
+               "linuxhello daemon: face recognition not compiled in; "
+               "skipping biometric for '%s'", username);
+#endif
 
     /* ── 6. Receive PIN from PAM client ─────────────────────────── */
     lh_auth_request_t pin_msg;

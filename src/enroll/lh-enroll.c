@@ -228,7 +228,8 @@ static int cmd_enroll(const char *username,
 
     if (!no_biometric) {
         printf("\nIR face enrollment:\n");
-        printf("  IR camera: %s  (GREY format, 640x360)\n", LH_IR_DEVICE);
+        printf("  IR camera: auto-detect (default %s, GREY format, 640x360)\n",
+               LH_IR_DEVICE);
         if (lh_face_is_enrolled(username))
             printf("  Note: a face template is already present and will be "
                    "replaced.\n");
@@ -246,7 +247,7 @@ static int cmd_enroll(const char *username,
              * A silent fallback would leave the system configured without
              * the biometric the user expected.
              */
-            printf("  Testing IR camera (%s)... ", LH_IR_DEVICE);
+            printf("  Testing IR camera (auto-detect)... ");
             fflush(stdout);
 
             int cam_rc = lh_ir_camera_test();
@@ -260,11 +261,8 @@ static int cmd_enroll(const char *username,
                         "  Quick diagnostics:\n"
                         "    ls -la /dev/video*\n"
                         "    v4l2-ctl --list-devices\n"
-                        "    sudo dmesg | grep -iE 'uvc|video|camera'\n"
-                        "    v4l2-ctl -d %s --list-formats-ext\n\n"
-                        "  If the device index is wrong, edit LH_IR_DEVICE_IDX\n"
-                        "  in src/biometric/ir_face.h and rebuild.\n",
-                        cam_rc, LH_IR_DEVICE);
+                        "    sudo dmesg | grep -iE 'uvc|video|camera'\n\n",
+                        cam_rc);
 
                 /* Clean up the credential we already wrote to disk */
                 lh_storage_delete_credential(username);
@@ -314,7 +312,7 @@ static int cmd_enroll(const char *username,
         printf("  TPM handle: 0x%08x\n", cred.tpm_handle);
 
     printf("\nAdd to PAM stack (e.g., /etc/pam.d/common-auth):\n");
-    printf("  auth  sufficient  pam_linuxhello.so\n");
+    printf("  auth  [success=done new_authtok_reqd=ok ignore=ignore auth_err=die default=ignore]  pam_linuxhello.so\n");
     return 0;
 }
 

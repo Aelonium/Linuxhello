@@ -126,4 +126,4 @@
 # * If unsure which greeter/DM is running on your system:
 #     systemctl status display-manager
 #
-auth  [success=done new_authtok_reqd=ok ignore=ignore auth_err=die default=ignore]  pam_linuxhello.so
+auth  [success=done new_authtok_reqd=ok ignore=ignore auth_err=die default=ignore]  pam_linuxhello.so  skip_on_service=sudo,su-l,su,cron,crond,polkit-1

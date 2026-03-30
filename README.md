@@ -143,20 +143,38 @@ sudo lh-enroll rotate --user alice
 
 ## PAM Configuration
 
-Add to `/etc/pam.d/common-auth` (Debian/Ubuntu) or equivalent:
+Replace `/etc/pam.d/common-auth` (Debian/Ubuntu/Linux Mint) with:
 
 ```
-# LinuxHello with password fallback (recommended for initial rollout):
-auth  [success=1 new_authtok_reqd=ok ignore=ignore default=ignore] \
+# LinuxHello: PIN replaces password (recommended for initial rollout):
+auth  [success=done new_authtok_reqd=ok ignore=ignore auth_err=die default=ignore] \
+            pam_linuxhello.so  skip_on_service=sudo,su-l,su,cron,crond,polkit-1
+
+# Existing password auth (fallback when PIN is skipped or user not enrolled):
+auth  [success=done new_authtok_reqd=ok ignore=ignore default=die] \
+            pam_unix.so nullok_secure try_first_pass
+
+auth  requisite   pam_deny.so
+auth  required    pam_permit.so
+```
+
+**Control flags explained:**
+- `success=done` – stop processing: correct PIN skips password entirely
+- `auth_err=die` – wrong PIN fails immediately (no second password prompt)
+- `ignore=ignore` – empty PIN / unenrolled user falls through to pam\_unix
+
+For LightDM (Linux Mint default), add above `@include common-auth` in
+`/etc/pam.d/lightdm`:
+```
+auth  [success=done new_authtok_reqd=ok ignore=ignore auth_err=die default=ignore] \
             pam_linuxhello.so
-
-# Existing password auth (fallback):
-auth  [success=1 default=die]  pam_unix.so nullok_secure try_first_pass
+@include common-auth
 ```
 
-For screen unlock with GDM, add to `/etc/pam.d/gdm-password`:
+For GDM, add above `@include common-auth` in `/etc/pam.d/gdm-password`:
 ```
-auth  sufficient  pam_linuxhello.so
+auth  [success=done new_authtok_reqd=ok ignore=ignore auth_err=die default=ignore] \
+            pam_linuxhello.so
 @include common-auth
 ```
 

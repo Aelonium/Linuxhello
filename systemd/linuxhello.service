@@ -35,11 +35,14 @@ PrivateTmp=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
-MemoryDenyWriteExecute=yes
+# MemoryDenyWriteExecute is intentionally not set: the IR face recognition
+# pipeline (OpenCV) may require writable+executable memory mappings.
 # Allow AF_UNIX sockets and TPM device access
 RestrictAddressFamilies=AF_UNIX
 DeviceAllow=/dev/tpm0    rw
 DeviceAllow=/dev/tpmrm0  rw
+# Allow IR camera access for face recognition
+DeviceAllow=/dev/video* rw
 # Capabilities: none needed beyond root's innate access to /dev/tpm*
 CapabilityBoundingSet=
 AmbientCapabilities=

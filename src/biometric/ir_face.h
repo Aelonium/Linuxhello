@@ -42,10 +42,12 @@ extern "C" {
 
 /* ── Configuration ────────────────────────────────────────── */
 
-/** V4L2 device index for the IR camera (/dev/video2) */
+/** Default V4L2 device index for the IR camera (/dev/video2) */
 #define LH_IR_DEVICE_IDX  2
-/** V4L2 device path for error messages / diagnostics */
+/** Default V4L2 device path (used as first candidate during auto-detect) */
 #define LH_IR_DEVICE      "/dev/video2"
+/** Maximum device index to scan during IR camera auto-detection */
+#define LH_IR_DEVICE_MAX  9
 /** Haar cascade shipped with libopencv-objdetect-dev */
 #define LH_FACE_CASCADE   "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"
 /** Seconds to wait for a face during verification */

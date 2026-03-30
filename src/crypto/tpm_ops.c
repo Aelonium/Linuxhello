@@ -955,4 +955,14 @@ int lh_tpm_nv_reset_counter(lh_tpm_ctx_t *ctx, uint32_t s)
     return -1;
 }
 
+int lh_tpm_evict_range(lh_tpm_ctx_t *ctx,
+                        TPM2_HANDLE   base,
+                        TPM2_HANDLE   max,
+                        uint32_t     *out_evicted)
+{
+    (void)ctx; (void)base; (void)max;
+    if (out_evicted) *out_evicted = 0;
+    return -1;
+}
+
 #endif /* LH_NO_TPM2 */
